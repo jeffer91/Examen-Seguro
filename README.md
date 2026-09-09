@@ -1,27 +1,33 @@
-# Examen Seguro ITSQMET — Administrador
+# ITSQMET Examen Seguro — Administrador
 
-Rama de administración del sistema de supervisión de Exámenes Complexivos de ITSQMET.
+Rama `admin` del sistema de supervisión de Exámenes Complexivos del ITSQMET.
 
-## Objetivo
+Incluye:
+- API ASP.NET Core + SignalR.
+- Panel web React para Administrador.
+- Configuración de exámenes, estudiantes, equipos, asignaciones y reglas.
+- Consulta de sesiones, incidencias y capturas.
+- Persistencia central en Neon/PostgreSQL.
 
-El Administrador configura exámenes, usuarios, reglas de incidencias, aplicaciones/sitios que generan alerta, dispositivos y acceso de veedores. También consulta historial y reportes.
+## Seguridad y alcance
+El sistema supervisa únicamente sesiones de examen previamente informadas. No incorpora keylogging ni lectura del contenido de conversaciones privadas. La navegación se registra mediante el complemento de navegador del cliente y las capturas se generan únicamente ante incidencias configuradas.
 
-## Alcance inicial
+## Variables del servidor
+- `DATABASE_URL`: cadena PostgreSQL de Neon.
+- `ADMIN_API_KEY`: clave del panel Administrador.
+- `VIEWER_API_KEY`: clave del panel Veedor.
+- `AGENT_API_KEY`: clave de los clientes instalados.
 
-- Dashboard general.
-- Gestión de exámenes.
-- Gestión de reglas de incidencias.
-- Gestión de veedores.
-- Consulta de estudiantes/dispositivos.
-- Historial de alertas y evidencias.
-- Configuración de conexión con Neon y API.
+## Desarrollo
+Servidor:
+```bash
+cd server
+dotnet run
+```
 
-## Seguridad
-
-No incluir claves reales en el repositorio. Las variables sensibles deben configurarse mediante variables de entorno.
-
-## Stack
-
-- React + TypeScript + Vite.
-- Backend/API separado por configurar.
-- Neon/PostgreSQL como base de datos.
+Panel:
+```bash
+cd web
+npm install
+npm run dev
+```

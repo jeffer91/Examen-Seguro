@@ -1,0 +1,26 @@
+name: CI Admin
+on:
+  push:
+    branches: [admin]
+  pull_request:
+    branches: [admin]
+jobs:
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+      - run: dotnet build server/Itsqmet.ExamServer.csproj -c Release
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm install
+        working-directory: web
+      - run: npm run build
+        working-directory: web

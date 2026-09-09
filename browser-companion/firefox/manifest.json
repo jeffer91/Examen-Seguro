@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "ITSQMET Examen Seguro - Navegación",
+  "version": "0.1.0",
+  "description": "Complemento institucional de supervisión durante sesiones activas de examen.",
+  "permissions": ["webNavigation", "<all_urls>"],
+  "host_permissions": ["http://127.0.0.1:43119/*"],
+  "background": {"scripts": ["background.js"]},
+  "browser_specific_settings": {"gecko": {"id": "examen-seguro@itsqmet.edu.ec"}}
+}

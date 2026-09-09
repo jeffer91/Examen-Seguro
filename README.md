@@ -1,28 +1,26 @@
-# Examen Seguro ITSQMET — Cliente
+# ITSQMET Examen Seguro — Cliente Windows
 
-Rama destinada a la aplicación que se instala en los equipos usados durante los Exámenes Complexivos de ITSQMET.
+Rama `cliente` del agente que se instala en los equipos donde se rinde el Examen Complexivo.
 
-## Objetivo
+## Componentes
+- `src/Itsqmet.ExamAgent`: agente en la sesión del usuario. Registra cambios de aplicación, recibe navegación de los complementos de navegador y toma capturas únicamente cuando una regla configurada genera una incidencia.
+- `src/Itsqmet.ExamService`: servicio Windows de supervisión del estado del agente.
+- `browser-companion`: complemento para Chromium (Chrome/Edge/Brave) y Firefox. Registra navegación durante la sesión activa sin leer el contenido de formularios ni pulsaciones de teclado.
+- `installer`: scripts de instalación/desinstalación para laboratorio.
 
-Conectar el equipo del examen con el servidor institucional durante una sesión previamente informada al estudiante.
+## Inicio de la supervisión
+El software puede estar instalado y permanecer inactivo. Solo comienza a registrar una sesión cuando el Administrador arma una asignación que tenga consentimiento informado registrado. No existe keylogger ni captura continua de pantalla.
 
-## Alcance inicial
+## Configuración
+`C:\ProgramData\ITSQMET\ExamenSeguro\client.json`
 
-- Windows 10/11 de 64 bits.
-- Registro del dispositivo.
-- Inicio y finalización de sesión.
-- Heartbeat con el servidor.
-- Registro de incidencias técnicas durante la sesión.
-- Sincronización diferida cuando se pierde temporalmente la conexión.
+```json
+{
+  "serverUrl": "https://servidor.example/",
+  "agentKey": "CLAVE_DE_AGENTE",
+  "deviceCode": "GUID-DEL-EQUIPO"
+}
+```
 
-## Privacidad
-
-La aplicación se limita a la sesión de examen y no recopila actividad anterior o posterior a ella.
-
-## Stack previsto
-
-- C# / .NET 10.
-- Servicio de Windows y componente de sesión.
-- SQLite local para cola temporal.
-- HTTPS/SignalR con el servidor.
-- Neon/PostgreSQL en el backend central.
+## Compilación
+La acción `Build Windows Client` genera un artefacto para Windows x64.

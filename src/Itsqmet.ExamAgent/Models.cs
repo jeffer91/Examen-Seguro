@@ -1,5 +1,3 @@
-using System.Text.Json.Serialization;
-
 namespace Itsqmet.ExamAgent;
 
 public sealed class AgentConfig
@@ -15,6 +13,8 @@ public sealed record StartSessionResponse(Guid SessionId, Guid ExamId);
 public sealed record RuleDto(Guid Id, Guid? ExamId, string Kind, string Pattern, string Label, string Severity, bool Enabled, bool CaptureOnMatch);
 public sealed record BrowserEvent(string Url, string? Title, string Browser);
 public sealed record SessionState(Guid AssignmentId, Guid ExamId, Guid SessionId, string StudentCode, string StudentName, DateTimeOffset StartedAt);
+public sealed record OfflineEnvelope(Guid SessionId, EventPayload Payload);
+
 public sealed class EventPayload
 {
     public DateTimeOffset OccurredAt { get; set; } = DateTimeOffset.UtcNow;

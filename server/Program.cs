@@ -1,21 +1,25 @@
 using System.Security.Cryptography;
+using System.Text;
 using System.Text.Json;
 using Itsqmet.ExamServer;
 using Microsoft.AspNetCore.SignalR;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
+
+var allowedOrigins = (Environment.GetEnvironmentVariable("ALLOWED_ORIGINS") ?? "http://localhost:5173,http://localhost:5174,http://localhost:4173,http://localhost:4174")
+    .Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
 builder.Services.AddSignalR();
-builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
+builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.WithOrigins(allowedOrigins).AllowAnyHeader().AllowAnyMethod()));
+
+var connectionString = RequiredSecret("DATABASE_URL");
+var adminKey = RequiredSecret("ADMIN_API_KEY");
+var viewerKey = RequiredSecret("VIEWER_API_KEY");
+var agentKey = RequiredSecret("AGENT_API_KEY");
 
 var app = builder.Build();
 app.UseCors();
-
-var connectionString = Environment.GetEnvironmentVariable("DATABASE_URL")
-    ?? throw new InvalidOperationException("DATABASE_URL no está configurada.");
-var adminKey = Environment.GetEnvironmentVariable("ADMIN_API_KEY") ?? "dev-admin-change-me";
-var viewerKey = Environment.GetEnvironmentVariable("VIEWER_API_KEY") ?? "dev-viewer-change-me";
-var agentKey = Environment.GetEnvironmentVariable("AGENT_API_KEY") ?? "dev-agent-change-me";
 
 app.Use(async (ctx, next) =>
 {
@@ -29,9 +33,9 @@ app.Use(async (ctx, next) =>
     if (ctx.Request.Path.StartsWithSegments("/hub/monitor"))
         key ??= ctx.Request.Query["key"].FirstOrDefault();
 
-    var role = key == adminKey ? "admin"
-        : key == viewerKey ? "veedor"
-        : key == agentKey ? "agent"
+    var role = FixedEquals(key, adminKey) ? "admin"
+        : FixedEquals(key, viewerKey) ? "veedor"
+        : FixedEquals(key, agentKey) ? "agent"
         : null;
 
     if (role is null)
@@ -44,6 +48,18 @@ app.Use(async (ctx, next) =>
     ctx.Items["role"] = role;
     await next();
 });
+
+static string RequiredSecret(string name) => Environment.GetEnvironmentVariable(name) is { Length: > 0 } value
+    ? value
+    : throw new InvalidOperationException($"{name} no está configurada.");
+
+static bool FixedEquals(string? supplied, string expected)
+{
+    if (string.IsNullOrEmpty(supplied)) return false;
+    var a = Encoding.UTF8.GetBytes(supplied);
+    var b = Encoding.UTF8.GetBytes(expected);
+    return a.Length == b.Length && CryptographicOperations.FixedTimeEquals(a, b);
+}
 
 static bool IsRole(HttpContext ctx, params string[] roles) => roles.Contains(ctx.Items["role"]?.ToString());
 static IResult Forbidden() => Results.StatusCode(StatusCodes.Status403Forbidden);
@@ -90,24 +106,41 @@ app.MapGet("/api/exams", async (HttpContext ctx) =>
 app.MapPost("/api/admin/exams", async (HttpContext ctx, CreateExamRequest req) =>
 {
     if (!IsRole(ctx, "admin")) return Forbidden();
+    if (string.IsNullOrWhiteSpace(req.Name)) return Results.BadRequest(new { message = "El nombre del examen es obligatorio." });
     await using var db = await OpenDb();
     await using var cmd = new NpgsqlCommand("INSERT INTO exams(name,career,starts_at,ends_at) VALUES($1,$2,$3,$4) RETURNING id", db);
-    cmd.Parameters.AddWithValue(req.Name);
-    cmd.Parameters.AddWithValue((object?)req.Career ?? DBNull.Value);
-    cmd.Parameters.AddWithValue((object?)req.StartsAt ?? DBNull.Value);
-    cmd.Parameters.AddWithValue((object?)req.EndsAt ?? DBNull.Value);
+    cmd.Parameters.AddWithValue(req.Name.Trim());
+    cmd.Parameters.AddWithValue((object?)req.Career?.Trim() ?? DBNull.Value);
+    cmd.Parameters.AddWithValue((object?)req.StartsAt?.UtcDateTime ?? DBNull.Value);
+    cmd.Parameters.AddWithValue((object?)req.EndsAt?.UtcDateTime ?? DBNull.Value);
     return Results.Ok(new { id = (Guid)(await cmd.ExecuteScalarAsync())! });
 });
 
-app.MapPost("/api/admin/exams/{id:guid}/status/{status}", async (HttpContext ctx, Guid id, string status) =>
+app.MapPost("/api/admin/exams/{id:guid}/status/{status}", async (HttpContext ctx, Guid id, string status, IHubContext<MonitorHub> hub) =>
 {
     if (!IsRole(ctx, "admin")) return Forbidden();
     if (status is not ("draft" or "active" or "closed")) return Results.BadRequest();
+
     await using var db = await OpenDb();
-    await using var cmd = new NpgsqlCommand("UPDATE exams SET status=$1 WHERE id=$2", db);
+    await using var tx = await db.BeginTransactionAsync();
+    await using var cmd = new NpgsqlCommand("UPDATE exams SET status=$1 WHERE id=$2", db, tx);
     cmd.Parameters.AddWithValue(status);
     cmd.Parameters.AddWithValue(id);
-    await cmd.ExecuteNonQueryAsync();
+    if (await cmd.ExecuteNonQueryAsync() != 1) return Results.NotFound();
+
+    if (status == "closed")
+    {
+        await using var assignments = new NpgsqlCommand("UPDATE exam_assignments SET status='finished' WHERE exam_id=$1 AND status IN ('armed','active')", db, tx);
+        assignments.Parameters.AddWithValue(id);
+        await assignments.ExecuteNonQueryAsync();
+
+        await using var sessions = new NpgsqlCommand("UPDATE exam_sessions SET status='finished',finished_at=COALESCE(finished_at,now()) WHERE exam_id=$1 AND status='active'", db, tx);
+        sessions.Parameters.AddWithValue(id);
+        await sessions.ExecuteNonQueryAsync();
+    }
+
+    await tx.CommitAsync();
+    if (status == "closed") await hub.Clients.Group($"exam:{id}").SendAsync("examClosed", new { examId = id });
     return Results.NoContent();
 });
 
@@ -126,11 +159,14 @@ app.MapGet("/api/students", async (HttpContext ctx) =>
 app.MapPost("/api/admin/students", async (HttpContext ctx, CreateStudentRequest req) =>
 {
     if (!IsRole(ctx, "admin")) return Forbidden();
+    if (string.IsNullOrWhiteSpace(req.StudentCode) || string.IsNullOrWhiteSpace(req.FullName))
+        return Results.BadRequest(new { message = "Código y nombre del estudiante son obligatorios." });
+
     await using var db = await OpenDb();
     await using var cmd = new NpgsqlCommand("INSERT INTO students(student_code,full_name,career) VALUES($1,$2,$3) ON CONFLICT(student_code) DO UPDATE SET full_name=EXCLUDED.full_name,career=EXCLUDED.career RETURNING id", db);
-    cmd.Parameters.AddWithValue(req.StudentCode);
-    cmd.Parameters.AddWithValue(req.FullName);
-    cmd.Parameters.AddWithValue((object?)req.Career ?? DBNull.Value);
+    cmd.Parameters.AddWithValue(req.StudentCode.Trim());
+    cmd.Parameters.AddWithValue(req.FullName.Trim());
+    cmd.Parameters.AddWithValue((object?)req.Career?.Trim() ?? DBNull.Value);
     return Results.Ok(new { id = (Guid)(await cmd.ExecuteScalarAsync())! });
 });
 
@@ -160,8 +196,9 @@ app.MapGet("/api/devices", async (HttpContext ctx) =>
 app.MapPost("/api/agent/register", async (HttpContext ctx, RegisterDeviceRequest req) =>
 {
     if (!IsRole(ctx, "agent")) return Forbidden();
+    if (string.IsNullOrWhiteSpace(req.DeviceCode) || string.IsNullOrWhiteSpace(req.Hostname)) return Results.BadRequest();
     await using var db = await OpenDb();
-    await using var cmd = new NpgsqlCommand("INSERT INTO devices(device_code,hostname,windows_version,agent_version,last_seen_at) VALUES($1,$2,$3,$4,now()) ON CONFLICT(device_code) DO UPDATE SET hostname=EXCLUDED.hostname,windows_version=EXCLUDED.windows_version,agent_version=EXCLUDED.agent_version,last_seen_at=now() RETURNING id", db);
+    await using var cmd = new NpgsqlCommand("INSERT INTO devices(device_code,hostname,windows_version,agent_version,last_seen_at) VALUES($1,$2,$3,$4,now()) ON CONFLICT(device_code) DO UPDATE SET hostname=EXCLUDED.hostname,windows_version=EXCLUDED.windows_version,agent_version=EXCLUDED.agent_version,last_seen_at=now(),active=true RETURNING id", db);
     cmd.Parameters.AddWithValue(req.DeviceCode);
     cmd.Parameters.AddWithValue(req.Hostname);
     cmd.Parameters.AddWithValue((object?)req.WindowsVersion ?? DBNull.Value);
@@ -185,10 +222,10 @@ app.MapPost("/api/admin/assignments/{id:guid}/arm", async (HttpContext ctx, Guid
 {
     if (!IsRole(ctx, "admin")) return Forbidden();
     await using var db = await OpenDb();
-    await using var cmd = new NpgsqlCommand("UPDATE exam_assignments SET status='armed' WHERE id=$1 AND consent_recorded=true", db);
+    await using var cmd = new NpgsqlCommand("UPDATE exam_assignments a SET status='armed' WHERE a.id=$1 AND a.consent_recorded=true AND a.status='ready' AND EXISTS(SELECT 1 FROM exams e WHERE e.id=a.exam_id AND e.status='active')", db);
     cmd.Parameters.AddWithValue(id);
     var n = await cmd.ExecuteNonQueryAsync();
-    return n == 1 ? Results.NoContent() : Results.BadRequest(new { message = "Debe registrarse el consentimiento informado antes de iniciar supervisión." });
+    return n == 1 ? Results.NoContent() : Results.BadRequest(new { message = "El examen debe estar activo y la supervisión debe constar como informada antes de iniciarla." });
 });
 
 app.MapPost("/api/admin/assignments/{id:guid}/finish", async (HttpContext ctx, Guid id, IHubContext<MonitorHub> hub) =>
@@ -208,7 +245,7 @@ app.MapPost("/api/admin/assignments/{id:guid}/finish", async (HttpContext ctx, G
     await using var a = new NpgsqlCommand("UPDATE exam_assignments SET status='finished' WHERE id=$1", db, tx);
     a.Parameters.AddWithValue(id);
     await a.ExecuteNonQueryAsync();
-    await using var s = new NpgsqlCommand("UPDATE exam_sessions SET status='finished',finished_at=now() WHERE exam_id=$1 AND student_id=$2 AND device_id=$3 AND status='active'", db, tx);
+    await using var s = new NpgsqlCommand("UPDATE exam_sessions SET status='finished',finished_at=COALESCE(finished_at,now()) WHERE exam_id=$1 AND student_id=$2 AND device_id=$3 AND status='active'", db, tx);
     s.Parameters.AddWithValue(examId);
     s.Parameters.AddWithValue(studentId);
     s.Parameters.AddWithValue(deviceId);
@@ -238,7 +275,7 @@ app.MapGet("/api/agent/assignment/{deviceCode}", async (HttpContext ctx, string 
     touch.Parameters.AddWithValue(deviceCode);
     await touch.ExecuteNonQueryAsync();
 
-    await using var cmd = new NpgsqlCommand("SELECT a.id,a.exam_id,e.name,s.student_code,s.full_name,a.status FROM exam_assignments a JOIN devices d ON d.id=a.device_id JOIN exams e ON e.id=a.exam_id JOIN students s ON s.id=a.student_id WHERE d.device_code=$1 AND a.status IN ('armed','active') ORDER BY a.created_at DESC LIMIT 1", db);
+    await using var cmd = new NpgsqlCommand("SELECT a.id,a.exam_id,e.name,s.student_code,s.full_name,a.status FROM exam_assignments a JOIN devices d ON d.id=a.device_id JOIN exams e ON e.id=a.exam_id JOIN students s ON s.id=a.student_id WHERE d.device_code=$1 AND e.status='active' AND a.status IN ('armed','active') ORDER BY a.created_at DESC LIMIT 1", db);
     cmd.Parameters.AddWithValue(deviceCode);
     await using var r = await cmd.ExecuteReaderAsync();
     if (!await r.ReadAsync()) return Results.NoContent();
@@ -251,7 +288,7 @@ app.MapPost("/api/agent/session/start", async (HttpContext ctx, StartSessionRequ
     await using var db = await OpenDb();
     await using var tx = await db.BeginTransactionAsync();
 
-    await using var q = new NpgsqlCommand("SELECT a.exam_id,a.student_id,a.device_id,a.consent_recorded FROM exam_assignments a JOIN devices d ON d.id=a.device_id WHERE a.id=$1 AND d.device_code=$2 AND a.status IN ('armed','active') FOR UPDATE", db, tx);
+    await using var q = new NpgsqlCommand("SELECT a.exam_id,a.student_id,a.device_id,a.consent_recorded FROM exam_assignments a JOIN devices d ON d.id=a.device_id JOIN exams e ON e.id=a.exam_id WHERE a.id=$1 AND d.device_code=$2 AND e.status='active' AND a.status IN ('armed','active') FOR UPDATE", db, tx);
     q.Parameters.AddWithValue(req.AssignmentId);
     q.Parameters.AddWithValue(req.DeviceCode);
     await using var r = await q.ExecuteReaderAsync();
@@ -294,14 +331,14 @@ app.MapPost("/api/agent/session/{sessionId:guid}/heartbeat", async (HttpContext 
 {
     if (!IsRole(ctx, "agent")) return Forbidden();
     await using var db = await OpenDb();
-    await using var update = new NpgsqlCommand("UPDATE exam_sessions SET last_heartbeat_at=now(),status='active' WHERE id=$1 AND status='active' RETURNING exam_id", db);
+    await using var update = new NpgsqlCommand("UPDATE exam_sessions SET last_heartbeat_at=now() WHERE id=$1 AND status='active' RETURNING exam_id", db);
     update.Parameters.AddWithValue(sessionId);
     var examValue = await update.ExecuteScalarAsync();
     if (examValue is not Guid examId) return Results.NotFound();
 
     await using var hb = new NpgsqlCommand("INSERT INTO heartbeats(session_id,agent_status) VALUES($1,$2)", db);
     hb.Parameters.AddWithValue(sessionId);
-    hb.Parameters.AddWithValue(req.Status);
+    hb.Parameters.AddWithValue(string.IsNullOrWhiteSpace(req.Status) ? "online" : req.Status);
     await hb.ExecuteNonQueryAsync();
     await hub.Clients.Group($"exam:{examId}").SendAsync("heartbeat", new { sessionId, status=req.Status, at=DateTimeOffset.UtcNow });
     return Results.NoContent();
@@ -310,13 +347,29 @@ app.MapPost("/api/agent/session/{sessionId:guid}/heartbeat", async (HttpContext 
 app.MapPost("/api/agent/session/{sessionId:guid}/event", async (HttpContext ctx, Guid sessionId, EventRequest req, IHubContext<MonitorHub> hub) =>
 {
     if (!IsRole(ctx, "agent")) return Forbidden();
+    if (req.Severity is not ("info" or "low" or "medium" or "high" or "critical")) return Results.BadRequest(new { message = "Severidad no válida." });
+    if (string.IsNullOrWhiteSpace(req.EventType)) return Results.BadRequest(new { message = "Tipo de evento obligatorio." });
+
+    byte[]? screenshotBytes = null;
+    if (!string.IsNullOrWhiteSpace(req.ScreenshotBase64))
+    {
+        try { screenshotBytes = Convert.FromBase64String(req.ScreenshotBase64); }
+        catch { return Results.BadRequest(new { message = "Captura inválida." }); }
+        if (screenshotBytes.Length > 4 * 1024 * 1024) return Results.BadRequest(new { message = "La captura supera el límite permitido." });
+    }
+
     await using var db = await OpenDb();
     await using var tx = await db.BeginTransactionAsync();
 
+    await using var check = new NpgsqlCommand("SELECT exam_id FROM exam_sessions WHERE id=$1", db, tx);
+    check.Parameters.AddWithValue(sessionId);
+    var examValue = await check.ExecuteScalarAsync();
+    if (examValue is not Guid examId) return Results.NotFound();
+
     await using var e = new NpgsqlCommand("INSERT INTO events(session_id,occurred_at,event_type,severity,process_name,domain,url,folder_path,duration_ms,metadata) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb) RETURNING id", db, tx);
     e.Parameters.AddWithValue(sessionId);
-    e.Parameters.AddWithValue(req.OccurredAt);
-    e.Parameters.AddWithValue(req.EventType);
+    e.Parameters.AddWithValue(req.OccurredAt.UtcDateTime);
+    e.Parameters.AddWithValue(req.EventType.Trim());
     e.Parameters.AddWithValue(req.Severity);
     e.Parameters.AddWithValue((object?)req.ProcessName ?? DBNull.Value);
     e.Parameters.AddWithValue((object?)req.Domain ?? DBNull.Value);
@@ -326,27 +379,23 @@ app.MapPost("/api/agent/session/{sessionId:guid}/event", async (HttpContext ctx,
     e.Parameters.AddWithValue(JsonSerializer.Serialize(req.Metadata ?? new Dictionary<string, object>()));
     var eventId = (Guid)(await e.ExecuteScalarAsync())!;
 
-    if (!string.IsNullOrWhiteSpace(req.ScreenshotBase64))
+    if (screenshotBytes is not null)
     {
-        var bytes = Convert.FromBase64String(req.ScreenshotBase64);
-        var hash = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+        var hash = Convert.ToHexString(SHA256.HashData(screenshotBytes)).ToLowerInvariant();
         await using var s = new NpgsqlCommand("INSERT INTO screenshots(event_id,storage_key,sha256,width,height,image_bytes,content_type) VALUES($1,$2,$3,$4,$5,$6,$7)", db, tx);
         s.Parameters.AddWithValue(eventId);
         s.Parameters.AddWithValue($"db:{eventId}");
         s.Parameters.AddWithValue(hash);
         s.Parameters.AddWithValue((object?)req.ScreenshotWidth ?? DBNull.Value);
         s.Parameters.AddWithValue((object?)req.ScreenshotHeight ?? DBNull.Value);
-        s.Parameters.AddWithValue(bytes);
+        s.Parameters.AddWithValue(screenshotBytes);
         s.Parameters.AddWithValue(req.ScreenshotContentType ?? "image/jpeg");
         await s.ExecuteNonQueryAsync();
     }
 
-    await using var q = new NpgsqlCommand("SELECT exam_id FROM exam_sessions WHERE id=$1", db, tx);
-    q.Parameters.AddWithValue(sessionId);
-    var examId = (Guid)(await q.ExecuteScalarAsync())!;
     await tx.CommitAsync();
 
-    var payload = new { eventId, sessionId, examId, req.OccurredAt, req.EventType, req.Severity, req.ProcessName, req.Domain, req.Url, hasScreenshot=!string.IsNullOrWhiteSpace(req.ScreenshotBase64) };
+    var payload = new { eventId, sessionId, examId, req.OccurredAt, req.EventType, req.Severity, req.ProcessName, req.Domain, req.Url, req.FolderPath, hasScreenshot=screenshotBytes is not null };
     await hub.Clients.Group($"exam:{examId}").SendAsync("incident", payload);
     return Results.Ok(payload);
 });
@@ -380,7 +429,7 @@ app.MapGet("/api/events/{examId:guid}", async (HttpContext ctx, Guid examId) =>
 {
     if (!IsRole(ctx, "admin", "veedor")) return Forbidden();
     await using var db = await OpenDb();
-    await using var cmd = new NpgsqlCommand("SELECT ev.id,ev.session_id,s.student_code,s.full_name,ev.occurred_at,ev.event_type,ev.severity,ev.process_name,ev.domain,ev.url,(sc.id IS NOT NULL) has_screenshot FROM events ev JOIN exam_sessions es ON es.id=ev.session_id JOIN students s ON s.id=es.student_id LEFT JOIN screenshots sc ON sc.event_id=ev.id WHERE es.exam_id=$1 ORDER BY ev.occurred_at DESC LIMIT 500", db);
+    await using var cmd = new NpgsqlCommand("SELECT ev.id,ev.session_id,s.student_code,s.full_name,ev.occurred_at,ev.event_type,ev.severity,ev.process_name,ev.domain,ev.url,ev.folder_path,(sc.id IS NOT NULL) has_screenshot FROM events ev JOIN exam_sessions es ON es.id=ev.session_id JOIN students s ON s.id=es.student_id LEFT JOIN screenshots sc ON sc.event_id=ev.id WHERE es.exam_id=$1 ORDER BY ev.occurred_at DESC LIMIT 500", db);
     cmd.Parameters.AddWithValue(examId);
     await using var r = await cmd.ExecuteReaderAsync();
     var rows = new List<object>();
@@ -398,7 +447,8 @@ app.MapGet("/api/events/{examId:guid}", async (HttpContext ctx, Guid examId) =>
             processName = r.IsDBNull(7) ? null : r.GetString(7),
             domain = r.IsDBNull(8) ? null : r.GetString(8),
             url = r.IsDBNull(9) ? null : r.GetString(9),
-            hasScreenshot = r.GetBoolean(10)
+            folderPath = r.IsDBNull(10) ? null : r.GetString(10),
+            hasScreenshot = r.GetBoolean(11)
         });
     }
     return Results.Ok(rows);
@@ -443,12 +493,16 @@ app.MapGet("/api/rules", async (HttpContext ctx, Guid? examId) =>
 app.MapPost("/api/admin/rules", async (HttpContext ctx, CreateRuleRequest req) =>
 {
     if (!IsRole(ctx, "admin")) return Forbidden();
+    if (req.Kind is not ("process" or "domain" or "folder" or "focus" or "service")) return Results.BadRequest(new { message = "Tipo de regla no válido." });
+    if (req.Severity is not ("low" or "medium" or "high" or "critical")) return Results.BadRequest(new { message = "Severidad no válida." });
+    if (string.IsNullOrWhiteSpace(req.Pattern) || string.IsNullOrWhiteSpace(req.Label)) return Results.BadRequest(new { message = "Patrón y nombre son obligatorios." });
+
     await using var db = await OpenDb();
     await using var cmd = new NpgsqlCommand("INSERT INTO monitoring_rules(exam_id,kind,pattern,label,severity,capture_on_match) VALUES($1,$2,$3,$4,$5,$6) RETURNING id", db);
     cmd.Parameters.AddWithValue((object?)req.ExamId ?? DBNull.Value);
     cmd.Parameters.AddWithValue(req.Kind);
-    cmd.Parameters.AddWithValue(req.Pattern);
-    cmd.Parameters.AddWithValue(req.Label);
+    cmd.Parameters.AddWithValue(req.Pattern.Trim());
+    cmd.Parameters.AddWithValue(req.Label.Trim());
     cmd.Parameters.AddWithValue(req.Severity);
     cmd.Parameters.AddWithValue(req.CaptureOnMatch);
     return Results.Ok(new { id = (Guid)(await cmd.ExecuteScalarAsync())! });

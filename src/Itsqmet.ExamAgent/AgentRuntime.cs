@@ -13,10 +13,13 @@ public sealed class AgentRuntime : IDisposable
     private readonly string _statePath;
     private readonly string _offlinePath;
     private readonly HttpClient _http;
+    private readonly BrowserHistoryMonitor _history;
     private readonly JsonSerializerOptions _json = new(JsonSerializerDefaults.Web) { PropertyNameCaseInsensitive = true };
     private readonly SemaphoreSlim _queueLock = new(1, 1);
     private readonly CancellationTokenSource _cts = new();
     private readonly HashSet<string> _lastFolders = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTimeOffset> _recentNavigation = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _navigationLock = new();
     private SessionState? _session;
     private List<RuleDto> _rules = [];
     private string? _lastProcess;
@@ -30,6 +33,7 @@ public sealed class AgentRuntime : IDisposable
         _root = root;
         _statePath = Path.Combine(root, "current-session.json");
         _offlinePath = Path.Combine(root, "offline-events.ndjson");
+        _history = new BrowserHistoryMonitor(root);
         _http = new HttpClient { BaseAddress = new Uri(config.ServerUrl), Timeout = TimeSpan.FromSeconds(15) };
         _http.DefaultRequestHeaders.Add("X-ITSQMET-Key", config.AgentKey);
     }
@@ -43,6 +47,7 @@ public sealed class AgentRuntime : IDisposable
             Task.Run(() => PollAssignments(_cts.Token)),
             Task.Run(() => MonitorForeground(_cts.Token)),
             Task.Run(() => MonitorFolders(_cts.Token)),
+            Task.Run(() => MonitorBrowserHistory(_cts.Token)),
             Task.Run(() => MonitorService(_cts.Token)),
             Task.Run(() => Heartbeat(_cts.Token)),
             Task.Run(() => ReplayOffline(_cts.Token))
@@ -123,6 +128,7 @@ public sealed class AgentRuntime : IDisposable
             await File.WriteAllTextAsync(_statePath, JsonSerializer.Serialize(_session, _json), ct);
             _lastProcess = null;
             _lastFolders.Clear();
+            lock (_navigationLock) _recentNavigation.Clear();
             await LoadRules(a.ExamId);
             await SendEvent(new EventPayload
             {
@@ -140,6 +146,7 @@ public sealed class AgentRuntime : IDisposable
         _rules = [];
         _lastProcess = null;
         _lastFolders.Clear();
+        lock (_navigationLock) _recentNavigation.Clear();
         try { if (File.Exists(_statePath)) File.Delete(_statePath); } catch { }
         await Task.CompletedTask;
     }
@@ -227,6 +234,24 @@ public sealed class AgentRuntime : IDisposable
                 foreach (var folder in folders) _lastFolders.Add(folder);
             }
             await Task.Delay(1200, ct);
+        }
+    }
+
+    private async Task MonitorBrowserHistory(CancellationToken ct)
+    {
+        while (!ct.IsCancellationRequested)
+        {
+            var session = _session;
+            if (session is not null)
+            {
+                try
+                {
+                    foreach (var evt in _history.ReadNew(session.StartedAt))
+                        await HandleBrowser(evt, ct, "history");
+                }
+                catch { }
+            }
+            await Task.Delay(TimeSpan.FromSeconds(3), ct);
         }
     }
 
@@ -341,7 +366,7 @@ public sealed class AgentRuntime : IDisposable
                         AddCors(context.Response, origin!);
                         context.Response.StatusCode = 204;
                         context.Response.Close();
-                        if (evt is not null) await HandleBrowser(evt, ct);
+                        if (evt is not null) await HandleBrowser(evt, ct, "extension");
                     }
                     catch { try { context.Response.Close(); } catch { } }
                 }, ct);
@@ -363,18 +388,28 @@ public sealed class AgentRuntime : IDisposable
         r.Headers["Access-Control-Allow-Methods"] = "POST, OPTIONS";
     }
 
-    private async Task HandleBrowser(BrowserEvent evt, CancellationToken ct)
+    private async Task HandleBrowser(BrowserEvent evt, CancellationToken ct, string source)
     {
         if (_session is null) return;
         if (!Uri.TryCreate(evt.Url, UriKind.Absolute, out var u) || !(u.Scheme is "http" or "https")) return;
         var safeUrl = $"{u.Scheme}://{u.Host}{u.AbsolutePath}";
+        var navKey = evt.Browser + "|" + safeUrl;
+        lock (_navigationLock)
+        {
+            var now = DateTimeOffset.UtcNow;
+            if (_recentNavigation.TryGetValue(navKey, out var previous) && now - previous < TimeSpan.FromSeconds(5)) return;
+            _recentNavigation[navKey] = now;
+            foreach (var old in _recentNavigation.Where(x => now - x.Value > TimeSpan.FromMinutes(2)).Select(x => x.Key).ToArray())
+                _recentNavigation.Remove(old);
+        }
+
         await SendEvent(new EventPayload
         {
             EventType = "browser_navigation",
             Severity = "info",
             Domain = u.Host,
             Url = safeUrl,
-            Metadata = new() { { "browser", evt.Browser } }
+            Metadata = new() { { "browser", evt.Browser }, { "source", source } }
         }, false, ct);
 
         foreach (var rule in _rules.Where(x => x.Enabled && x.Kind == "domain" && DomainMatch(u.Host, x.Pattern)))
@@ -385,7 +420,7 @@ public sealed class AgentRuntime : IDisposable
                 Severity = rule.Severity,
                 Domain = u.Host,
                 Url = safeUrl,
-                Metadata = new() { { "browser", evt.Browser }, { "rule", rule.Label } }
+                Metadata = new() { { "browser", evt.Browser }, { "source", source }, { "rule", rule.Label } }
             }, rule.CaptureOnMatch, ct);
         }
     }

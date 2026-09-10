@@ -5,6 +5,7 @@ public sealed class AgentConfig
     public string ServerUrl { get; set; } = "http://localhost:5080/";
     public string AgentKey { get; set; } = "";
     public string DeviceCode { get; set; } = "";
+    public string BrowserBridgeKey { get; set; } = "";
     public int PollSeconds { get; set; } = 3;
 }
 
@@ -14,6 +15,7 @@ public sealed record RuleDto(Guid Id, Guid? ExamId, string Kind, string Pattern,
 public sealed record BrowserEvent(string Url, string? Title, string Browser);
 public sealed record SessionState(Guid AssignmentId, Guid ExamId, Guid SessionId, string StudentCode, string StudentName, DateTimeOffset StartedAt);
 public sealed record OfflineEnvelope(Guid SessionId, EventPayload Payload);
+public sealed record ForegroundActivity(string ProcessName, string? WindowTitle, string? FolderPath);
 
 public sealed class EventPayload
 {

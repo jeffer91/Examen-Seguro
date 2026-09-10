@@ -26,17 +26,36 @@ if(Test-Path "$PSScriptRoot\..\browser-companion"){
 
 $cfgPath="$data\client.json"
 $deviceCode=$null
+$browserBridgeKey=$null
 if(Test-Path $cfgPath){
-  try{$deviceCode=(Get-Content $cfgPath -Raw|ConvertFrom-Json).deviceCode}catch{}
+  try{
+    $old=Get-Content $cfgPath -Raw|ConvertFrom-Json
+    $deviceCode=$old.deviceCode
+    $browserBridgeKey=$old.browserBridgeKey
+  }catch{}
 }
 if(-not $deviceCode){$deviceCode=[guid]::NewGuid().ToString()}
+if(-not $browserBridgeKey){
+  $bytes=New-Object byte[] 32
+  [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+  $browserBridgeKey=[Convert]::ToBase64String($bytes)
+}
 
 @{
   serverUrl=$ServerUrl.TrimEnd('/')+'/'
   agentKey=$AgentKey
   deviceCode=$deviceCode
+  browserBridgeKey=$browserBridgeKey
   pollSeconds=3
 }|ConvertTo-Json|Set-Content -Encoding UTF8 $cfgPath
+
+# El complemento usa una clave local distinta de la clave del servidor.
+$escaped=$browserBridgeKey.Replace("'","\'")
+$bridgeConfig="self.ITSQMET_BRIDGE_KEY='$escaped';"
+$chromiumConfig="$companionDir\chromium\bridge-config.js"
+$firefoxConfig="$companionDir\firefox\bridge-config.js"
+if(Test-Path (Split-Path $chromiumConfig)){Set-Content -Path $chromiumConfig -Value $bridgeConfig -Encoding UTF8}
+if(Test-Path (Split-Path $firefoxConfig)){Set-Content -Path $firefoxConfig -Value $bridgeConfig -Encoding UTF8}
 
 # Resuelve el grupo integrado Users/Usuarios por SID para funcionar en Windows en cualquier idioma.
 $usersSid=New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
@@ -62,3 +81,4 @@ Start-ScheduledTask -TaskName 'ITSQMET Exam Agent'
 Write-Host "ITSQMET Examen Seguro instalado. Código de equipo: $deviceCode"
 Write-Host 'La supervisión permanece inactiva hasta que el Administrador habilite una sesión previamente informada.'
 Write-Host "Complementos de navegador copiados en: $companionDir"
+Write-Host 'En equipos institucionales, cargue los complementos mediante las políticas administradas del navegador.'

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Json;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 
@@ -61,7 +62,7 @@ public sealed class AgentRuntime : IDisposable
             deviceCode = _config.DeviceCode,
             hostname = Environment.MachineName,
             windowsVersion = Environment.OSVersion.VersionString,
-            agentVersion = "0.2.0"
+            agentVersion = "0.2.1"
         };
         try
         {
@@ -134,7 +135,7 @@ public sealed class AgentRuntime : IDisposable
             {
                 EventType = "session_started",
                 Severity = "info",
-                Metadata = new() { { "hostname", Environment.MachineName }, { "agentVersion", "0.2.0" } }
+                Metadata = new() { { "hostname", Environment.MachineName }, { "agentVersion", "0.2.1" } }
             }, false, ct);
         }
         catch { }
@@ -355,6 +356,12 @@ public sealed class AgentRuntime : IDisposable
                             context.Response.Close();
                             return;
                         }
+                        if (!FixedEquals(context.Request.Headers["X-ITSQMET-Bridge"], _config.BrowserBridgeKey))
+                        {
+                            context.Response.StatusCode = 403;
+                            context.Response.Close();
+                            return;
+                        }
                         if (context.Request.ContentLength64 > 16384)
                         {
                             context.Response.StatusCode = 413;
@@ -380,11 +387,19 @@ public sealed class AgentRuntime : IDisposable
         (origin.StartsWith("chrome-extension://", StringComparison.OrdinalIgnoreCase) ||
          origin.StartsWith("moz-extension://", StringComparison.OrdinalIgnoreCase));
 
+    private static bool FixedEquals(string? supplied, string expected)
+    {
+        if (string.IsNullOrWhiteSpace(supplied) || string.IsNullOrWhiteSpace(expected)) return false;
+        var a = Encoding.UTF8.GetBytes(supplied);
+        var b = Encoding.UTF8.GetBytes(expected);
+        return a.Length == b.Length && CryptographicOperations.FixedTimeEquals(a, b);
+    }
+
     private static void AddCors(HttpListenerResponse r, string origin)
     {
         r.Headers["Access-Control-Allow-Origin"] = origin;
         r.Headers["Vary"] = "Origin";
-        r.Headers["Access-Control-Allow-Headers"] = "content-type";
+        r.Headers["Access-Control-Allow-Headers"] = "content-type,x-itsqmet-bridge";
         r.Headers["Access-Control-Allow-Methods"] = "POST, OPTIONS";
     }
 

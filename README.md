@@ -21,6 +21,7 @@ Los parámetros de consulta y fragmentos de las URL no se envían al servidor. E
 - Cola local de eventos si el servidor o Internet no responden.
 - Reenvío automático de la cola cuando se recupera la conexión.
 - Detección del cierre del agente y del servicio durante una sesión activa.
+- El puente local de navegador exige una clave aleatoria propia de cada equipo además de validar el origen de extensión.
 
 ## Inicio de supervisión
 El software puede permanecer instalado e inactivo. Solo comienza a registrar cuando el Administrador habilita una asignación cuya supervisión haya sido previamente informada y registrada.
@@ -33,9 +34,12 @@ El software puede permanecer instalado e inactivo. Solo comienza a registrar cua
   "serverUrl": "https://servidor.example/",
   "agentKey": "CLAVE_DE_AGENTE",
   "deviceCode": "GUID-DEL-EQUIPO",
+  "browserBridgeKey": "CLAVE_LOCAL_ALEATORIA",
   "pollSeconds": 3
 }
 ```
+
+`browserBridgeKey` se genera automáticamente durante la instalación y no debe compartirse con la clave del servidor.
 
 ## Compilación
 La acción `Build Windows Client` genera el artefacto para Windows x64 con Agent, Service, instalador y complementos de navegador.
